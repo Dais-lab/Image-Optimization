@@ -17,9 +17,6 @@ os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
 
 
 def make_unique_folder(base_folder):
-    """
-    Create a unique folder with incremental numbering if the base folder exists.
-    """
     if not os.path.exists(base_folder):
         os.makedirs(base_folder)
         return base_folder
@@ -34,9 +31,6 @@ def make_unique_folder(base_folder):
 
 
 def detect_bit_depth(image_path: str) -> int:
-    """
-    Detects the bit depth of an image based on OpenCV's dtype.
-    """
     image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
     if image is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
@@ -49,9 +43,6 @@ def detect_bit_depth(image_path: str) -> int:
 
 
 def run_yolo_detection(source, yolo_results_folder):
-    """
-    Run YOLOv5 detection and save results in the specified folder.
-    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     yolo_script = os.path.join(current_dir, "yolov5", "detect.py")
     weights = os.path.join(current_dir, "yolov5", "weights", "best.pt")
@@ -87,9 +78,6 @@ def run_yolo_detection(source, yolo_results_folder):
 
 
 def load_yolo_results_and_crop(source_folder, coord_folder, crop_save_folder):
-    """
-    Maps YOLO results to original images and crops regions based on detections.
-    """
     cropped_data = []
 
     if not os.path.exists(crop_save_folder):
@@ -128,9 +116,6 @@ def load_yolo_results_and_crop(source_folder, coord_folder, crop_save_folder):
 
 
 def crop_from_original(image_path, coords, bit_depth):
-    """
-    Crops regions from the original image based on YOLO coordinates.
-    """
     image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
     if image is None:
         raise FileNotFoundError(f"Could not read image at {image_path}")
@@ -165,10 +150,17 @@ def crop_from_original(image_path, coords, bit_depth):
     return cropped_images
 
 
-def apply_histogram_equalization(image: Tensor, bit_depth: int) -> Tensor:
-    """
-    Applies histogram equalization to the image based on bit depth.
-    """
+def adjust_brightness(image: Tensor, beta: float, bit_depth: int) -> Tensor:
+    max_value = 255 if bit_depth == 8 else 65535
+    return torch.clamp(image + beta, 0, max_value)
+
+
+def adjust_contrast(image: Tensor, alpha: float, bit_depth: int) -> Tensor:
+    max_value = 255 if bit_depth == 8 else 65535
+    return torch.clamp(alpha * image, 0, max_value)
+
+
+def histogram_equalization(image: Tensor, bit_depth: int) -> Tensor:
     bins = 256 if bit_depth == 8 else 65536
     max_value = 255 if bit_depth == 8 else 65535
 
@@ -176,43 +168,41 @@ def apply_histogram_equalization(image: Tensor, bit_depth: int) -> Tensor:
     cdf = hist.cumsum(0)
     cdf_normalized = cdf / cdf[-1] * max_value
     equalized = cdf_normalized[image.long()]
-    equalized = torch.clamp(equalized, 0, max_value)
-    return equalized.view(image.size())
-
-
-def adjust_brightness_contrast(image: Tensor, alpha: float, beta: float, bit_depth: int) -> Tensor:
-    """
-    Adjusts brightness and contrast of the image based on bit depth.
-    """
-    max_value = 255 if bit_depth == 8 else 65535
-
-    adjusted = alpha * image + beta
-    adjusted = torch.clamp(adjusted, 0, max_value)
-    return adjusted
+    return torch.clamp(equalized, 0, max_value)
 
 
 def apply_preprocessing(image: Tensor, alpha: float, beta: float, bit_depth: int):
-    """
-    Applies preprocessing steps to the image (brightness/contrast adjustment and histogram equalization).
-    """
-    processed_image = adjust_brightness_contrast(image, alpha, beta, bit_depth)
-    processed_image = apply_histogram_equalization(processed_image, bit_depth)
-    return processed_image
+    preprocessing_steps = [
+        ("adjust_brightness", lambda img: adjust_brightness(img, beta, bit_depth)),
+        ("adjust_contrast", lambda img: adjust_contrast(img, alpha, bit_depth)),
+        ("histogram_equalization", lambda img: histogram_equalization(img, bit_depth)),
+    ]
+    random.shuffle(preprocessing_steps)
+
+    applied_order = []
+    for step_name, step_func in preprocessing_steps:
+        applied_order.append(step_name)
+        image = step_func(image)
+
+    return image, applied_order
 
 
 def objective_function(individual, image: Tensor, bit_depth: int):
-    """
-    Objective function for genetic algorithm with dynamic bit depth support.
-    """
     alpha, beta = individual[0], individual[1]
-    processed_image = apply_preprocessing(image, alpha, beta, bit_depth)
+    processed_image = apply_preprocessing(image, alpha, beta, bit_depth)[0]
     return processed_image.var().item(),
 
 
+def clamp_individual(individual, brightness_range, contrast_range):
+    """
+    Clamps the individual's values to ensure they are within the specified range.
+    """
+    individual[0] = max(contrast_range[0], min(contrast_range[1], individual[0]))  # Clamp contrast (alpha)
+    individual[1] = max(brightness_range[0], min(brightness_range[1], individual[1]))  # Clamp brightness (beta)
+    return individual
+
+
 def optimize_image(image: Tensor, bit_depth: int, ngen, pop_size, brightness_range, contrast_range, patience, delta):
-    """
-    Optimizes image processing parameters using a genetic algorithm.
-    """
     if "FitnessMax" not in creator.__dict__:
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
     if "Individual" not in creator.__dict__:
@@ -237,9 +227,17 @@ def optimize_image(image: Tensor, bit_depth: int, ngen, pop_size, brightness_ran
     best_individual = None
 
     for gen in tqdm(range(ngen), desc="Optimizing Image"):
+        # Apply crossover and mutation
         offspring = algorithms.varAnd(population, toolbox, cxpb=0.5, mutpb=0.2)
+
+        # Clamp offspring values to the specified ranges
+        for ind in offspring:
+            ind[:] = clamp_individual(ind, brightness_range, contrast_range)
+
+        # Evaluate offspring fitness
         fits = list(toolbox.map(toolbox.evaluate, offspring))
 
+        # Update best score and individual
         generation_best_score = max(fit[0] for fit in fits)
         if generation_best_score > best_score + delta:
             best_score = generation_best_score
@@ -248,10 +246,12 @@ def optimize_image(image: Tensor, bit_depth: int, ngen, pop_size, brightness_ran
         else:
             no_improve_count += 1
 
+        # Early stopping
         if no_improve_count >= patience:
             early_stop_gen = gen + 1
             break
 
+        # Update fitness and population
         for ind, fit in zip(offspring, fits):
             ind.fitness.values = fit
         population = toolbox.select(offspring, k=len(population))
@@ -260,20 +260,26 @@ def optimize_image(image: Tensor, bit_depth: int, ngen, pop_size, brightness_ran
     return alpha, beta, best_score, early_stop_gen
 
 
-def process_full_images(csv_path, source_folder, save_folder):
+def process_full_images(csv_path, source_folder, save_folder, use_gpu=False):
     """
-    Applies preprocessing to full original images based on optimization results in CSV.
+    Processes full images based on optimization results in CSV, with optional GPU support.
     """
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
+    # Load results from CSV
     results_df = pd.read_csv(csv_path)
+
+    # Select device: GPU if available and requested, otherwise CPU
+    device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
 
     for _, row in tqdm(results_df.iterrows(), total=len(results_df), desc="Processing Full Images"):
         image_name = row["Image Name"]
         alpha = row["Alpha (Contrast)"]
         beta = row["Beta (Brightness)"]
+        applied_order = row["Applied Order"].split(" -> ")
 
+        # Find the corresponding original image
         matching_images = glob.glob(os.path.join(source_folder, f"{os.path.splitext(image_name)[0]}.*"))
         if not matching_images:
             print(f"Warning: No matching original image found for {image_name}. Skipping.")
@@ -282,12 +288,21 @@ def process_full_images(csv_path, source_folder, save_folder):
         original_image_path = matching_images[0]
         bit_depth = detect_bit_depth(original_image_path)
 
+        # Load image and convert to Tensor on the selected device
         original_image = cv2.imread(original_image_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-        original_tensor = torch.tensor(original_image, dtype=torch.float32)
+        original_tensor = torch.tensor(original_image, dtype=torch.float32).to(device)
 
-        processed_tensor = apply_preprocessing(original_tensor, alpha, beta, bit_depth)
-        processed_image = processed_tensor.cpu().numpy().astype(np.uint8 if bit_depth == 8 else np.uint16)
+        # Apply preprocessing in the saved order
+        for step in applied_order:
+            if step == "adjust_brightness":
+                original_tensor = adjust_brightness(original_tensor, beta, bit_depth).to(device)
+            elif step == "adjust_contrast":
+                original_tensor = adjust_contrast(original_tensor, alpha, bit_depth).to(device)
+            elif step == "histogram_equalization":
+                original_tensor = histogram_equalization(original_tensor, bit_depth).to(device)
 
+        # Convert processed Tensor back to NumPy array and save the image
+        processed_image = original_tensor.cpu().numpy().astype(np.uint8 if bit_depth == 8 else np.uint16)
         save_path = os.path.join(save_folder, f"{os.path.splitext(image_name)[0]}_processed.png")
         cv2.imwrite(save_path, processed_image)
 
@@ -310,11 +325,11 @@ def process_yolo_results(source, result_folder, ngen, pop_size, brightness_range
         image_tensor = data["cropped_image"].to(device)
         bit_depth = detect_bit_depth(os.path.join(source, f"{data['image_name']}.png"))
 
-        alpha, beta, _, _ = optimize_image(
+        alpha, beta, best_score, _ = optimize_image(
             image_tensor, bit_depth, ngen, pop_size, brightness_range, contrast_range, patience, delta
         )
 
-        optimized_image = apply_preprocessing(image_tensor, alpha, beta, bit_depth)
+        optimized_image, applied_order = apply_preprocessing(image_tensor, alpha, beta, bit_depth)
         optimized_image_np = optimized_image.cpu().numpy().astype(np.uint8 if bit_depth == 8 else np.uint16)
         optimized_save_path = os.path.join(optimized_save_folder, f"{data['image_name']}_{data['cropped_index']}.png")
         cv2.imwrite(optimized_save_path, optimized_image_np)
@@ -322,7 +337,9 @@ def process_yolo_results(source, result_folder, ngen, pop_size, brightness_range
         results.append({
             "Image Name": data["image_name"],
             "Alpha (Contrast)": alpha,
-            "Beta (Brightness)": beta
+            "Beta (Brightness)": beta,
+            "Objective Score": best_score,
+            "Applied Order": " -> ".join(applied_order)
         })
 
     csv_path = os.path.join(result_folder, "optimization_results.csv")
