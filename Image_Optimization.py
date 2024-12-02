@@ -33,6 +33,21 @@ def make_unique_folder(base_folder):
             counter += 1
 
 
+def detect_bit_depth(image_path: str) -> int:
+    """
+    Detects the bit depth of an image based on OpenCV's dtype.
+    """
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    if image.dtype == np.uint8:
+        return 8
+    elif image.dtype == np.uint16:
+        return 16
+    else:
+        raise ValueError(f"Unsupported image bit depth: {image.dtype}")
+
+
 def run_yolo_detection(source, yolo_results_folder):
     """
     Run YOLOv5 detection and save results in the specified folder.
@@ -42,7 +57,7 @@ def run_yolo_detection(source, yolo_results_folder):
     weights = os.path.join(current_dir, "yolov5", "weights", "best.pt")
     imgsz = 1280
     max_det = 1
-    exp_name = "exp"  # Default YOLO experiment name
+    exp_name = "exp"
     coord_folder = os.path.join(yolo_results_folder, exp_name, "labels")
 
     if os.path.exists(coord_folder) and os.listdir(coord_folder):
@@ -71,39 +86,9 @@ def run_yolo_detection(source, yolo_results_folder):
     return coord_folder
 
 
-
-def crop_from_original(image_path, coords):
-    """
-    Crops regions from the original image based on YOLO coordinates.
-    """
-    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-    h, w = image.shape
-    cropped_images = []
-
-    for coord in coords:
-        values = coord.split()
-        if len(values) != 5:
-            print(f"Warning: Invalid YOLO coordinate format: {coord}. Skipping.")
-            continue
-
-        _, x_center, y_center, bbox_width, bbox_height = map(float, values)
-        x_center, y_center = x_center * w, y_center * h
-        bbox_width, bbox_height = bbox_width * w, bbox_height * h
-
-        x_min = max(0, int(x_center - bbox_width / 2))
-        y_min = max(0, int(y_center - bbox_height / 2))
-        x_max = min(w, int(x_center + bbox_width / 2))
-        y_max = min(h, int(y_center + bbox_height / 2))
-
-        cropped = image[y_min:y_max, x_min:x_max]
-        cropped_images.append(torch.tensor(cropped, dtype=torch.float32))
-
-    return cropped_images
-
-
 def load_yolo_results_and_crop(source_folder, coord_folder, crop_save_folder):
     """
-    Maps YOLO results to original 16-bit images and crops regions.
+    Maps YOLO results to original images and crops regions based on detections.
     """
     cropped_data = []
 
@@ -125,11 +110,12 @@ def load_yolo_results_and_crop(source_folder, coord_folder, crop_save_folder):
         with open(os.path.join(coord_folder, coord_file), 'r') as f:
             coords = [line.strip() for line in f.readlines()]
 
-        cropped_images = crop_from_original(image_path, coords)
+        bit_depth = detect_bit_depth(image_path)
+        cropped_images = crop_from_original(image_path, coords, bit_depth)
 
         for i, cropped_image in enumerate(tqdm(cropped_images, desc=f"Cropping {image_name}", leave=False)):
             crop_path = os.path.join(crop_save_folder, f"{image_name}_{i}.png")
-            cropped_image_np = cropped_image.cpu().numpy().astype(np.uint16)
+            cropped_image_np = cropped_image.cpu().numpy().astype(np.uint8 if bit_depth == 8 else np.uint16)
             cv2.imwrite(crop_path, cropped_image_np)
 
             cropped_data.append({
@@ -141,33 +127,92 @@ def load_yolo_results_and_crop(source_folder, coord_folder, crop_save_folder):
     return cropped_data
 
 
-def apply_histogram_equalization_torch(image: Tensor) -> Tensor:
-    hist = torch.histc(image, bins=65536, min=0, max=65535)
+def crop_from_original(image_path, coords, bit_depth):
+    """
+    Crops regions from the original image based on YOLO coordinates.
+    """
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image at {image_path}")
+
+    h, w = image.shape[:2]
+    cropped_images = []
+
+    for coord in coords:
+        values = coord.split()
+        if len(values) != 5:
+            print(f"Warning: Invalid YOLO coordinate format: {coord}. Skipping.")
+            continue
+
+        _, x_center, y_center, bbox_width, bbox_height = map(float, values)
+        x_center, y_center = x_center * w, y_center * h
+        bbox_width, bbox_height = bbox_width * w, bbox_height * h
+
+        x_min = max(0, int(x_center - bbox_width / 2))
+        y_min = max(0, int(y_center - bbox_height / 2))
+        x_max = min(w, int(x_center + bbox_width / 2))
+        y_max = min(h, int(y_center + bbox_height / 2))
+
+        cropped = image[y_min:y_max, x_min:x_max]
+
+        if cropped.size == 0:
+            print(f"Warning: Cropped region is empty for coordinates: {coord}")
+            continue
+
+        cropped_tensor = torch.tensor(cropped, dtype=torch.float)
+        cropped_images.append(cropped_tensor)
+
+    return cropped_images
+
+
+def apply_histogram_equalization(image: Tensor, bit_depth: int) -> Tensor:
+    """
+    Applies histogram equalization to the image based on bit depth.
+    """
+    bins = 256 if bit_depth == 8 else 65536
+    max_value = 255 if bit_depth == 8 else 65535
+
+    hist = torch.histc(image, bins=bins, min=0, max=max_value)
     cdf = hist.cumsum(0)
-    cdf_normalized = cdf / cdf[-1] * 65535
+    cdf_normalized = cdf / cdf[-1] * max_value
     equalized = cdf_normalized[image.long()]
+    equalized = torch.clamp(equalized, 0, max_value)
     return equalized.view(image.size())
 
 
-def adjust_brightness_contrast_torch(image: Tensor, alpha: float, beta: float) -> Tensor:
+def adjust_brightness_contrast(image: Tensor, alpha: float, beta: float, bit_depth: int) -> Tensor:
+    """
+    Adjusts brightness and contrast of the image based on bit depth.
+    """
+    max_value = 255 if bit_depth == 8 else 65535
+
     adjusted = alpha * image + beta
-    adjusted = torch.clamp(adjusted, 0, 65535)
+    adjusted = torch.clamp(adjusted, 0, max_value)
     return adjusted
 
 
-def apply_preprocessing_torch(image: Tensor, alpha: float, beta: float):
-    processed_image = adjust_brightness_contrast_torch(image, alpha, beta)
-    processed_image = apply_histogram_equalization_torch(processed_image)
+def apply_preprocessing(image: Tensor, alpha: float, beta: float, bit_depth: int):
+    """
+    Applies preprocessing steps to the image (brightness/contrast adjustment and histogram equalization).
+    """
+    processed_image = adjust_brightness_contrast(image, alpha, beta, bit_depth)
+    processed_image = apply_histogram_equalization(processed_image, bit_depth)
     return processed_image
 
 
-def objective_function_gpu(individual, image: Tensor):
+def objective_function(individual, image: Tensor, bit_depth: int):
+    """
+    Objective function for genetic algorithm with dynamic bit depth support.
+    """
     alpha, beta = individual[0], individual[1]
-    processed_image = apply_preprocessing_torch(image, alpha, beta)
+    processed_image = apply_preprocessing(image, alpha, beta, bit_depth)
     return processed_image.var().item(),
 
 
-def optimize_image_gpu(image: Tensor, ngen, pop_size, brightness_range, contrast_range, patience, delta):
+def optimize_image(image: Tensor, bit_depth: int, ngen, pop_size, brightness_range, contrast_range, patience, delta):
+    """
+    Optimizes image processing parameters using a genetic algorithm.
+    """
     if "FitnessMax" not in creator.__dict__:
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
     if "Individual" not in creator.__dict__:
@@ -180,7 +225,7 @@ def optimize_image_gpu(image: Tensor, ngen, pop_size, brightness_range, contrast
                      (toolbox.attr_alpha, toolbox.attr_beta), n=1)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    toolbox.register("evaluate", objective_function_gpu, image=image)
+    toolbox.register("evaluate", objective_function, image=image, bit_depth=bit_depth)
     toolbox.register("mate", tools.cxBlend, alpha=0.5)
     toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.2)
     toolbox.register("select", tools.selTournament, tournsize=3)
@@ -235,18 +280,19 @@ def process_full_images(csv_path, source_folder, save_folder):
             continue
 
         original_image_path = matching_images[0]
+        bit_depth = detect_bit_depth(original_image_path)
+
         original_image = cv2.imread(original_image_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
         original_tensor = torch.tensor(original_image, dtype=torch.float32)
 
-        processed_tensor = apply_preprocessing_torch(original_tensor, alpha, beta)
-        processed_image = processed_tensor.cpu().numpy().astype(np.uint16)
+        processed_tensor = apply_preprocessing(original_tensor, alpha, beta, bit_depth)
+        processed_image = processed_tensor.cpu().numpy().astype(np.uint8 if bit_depth == 8 else np.uint16)
 
         save_path = os.path.join(save_folder, f"{os.path.splitext(image_name)[0]}_processed.png")
         cv2.imwrite(save_path, processed_image)
 
 
 def process_yolo_results(source, result_folder, ngen, pop_size, brightness_range, contrast_range, patience, delta, use_gpu):
-    # Define folders for results
     yolo_results_folder = os.path.join(result_folder, "yolo_results")
     crop_save_folder = os.path.join(result_folder, "crops")
     optimized_save_folder = os.path.join(result_folder, "optimized")
@@ -255,24 +301,21 @@ def process_yolo_results(source, result_folder, ngen, pop_size, brightness_range
     if not os.path.exists(optimized_save_folder):
         os.makedirs(optimized_save_folder)
 
-    # Run YOLO detection and get coordinates
     coord_folder = run_yolo_detection(source, yolo_results_folder)
-
-    # Crop images based on YOLO results
     cropped_data = load_yolo_results_and_crop(source, coord_folder, crop_save_folder)
 
-    # Perform GA optimization on cropped images
     device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
     results = []
     for data in tqdm(cropped_data, desc="Optimizing Cropped Images"):
         image_tensor = data["cropped_image"].to(device)
+        bit_depth = detect_bit_depth(os.path.join(source, f"{data['image_name']}.png"))
 
-        alpha, beta, _, _ = optimize_image_gpu(
-            image_tensor, ngen, pop_size, brightness_range, contrast_range, patience, delta
+        alpha, beta, _, _ = optimize_image(
+            image_tensor, bit_depth, ngen, pop_size, brightness_range, contrast_range, patience, delta
         )
 
-        optimized_image = apply_preprocessing_torch(image_tensor, alpha, beta)
-        optimized_image_np = optimized_image.cpu().numpy().astype(np.uint16)
+        optimized_image = apply_preprocessing(image_tensor, alpha, beta, bit_depth)
+        optimized_image_np = optimized_image.cpu().numpy().astype(np.uint8 if bit_depth == 8 else np.uint16)
         optimized_save_path = os.path.join(optimized_save_folder, f"{data['image_name']}_{data['cropped_index']}.png")
         cv2.imwrite(optimized_save_path, optimized_image_np)
 
@@ -282,17 +325,15 @@ def process_yolo_results(source, result_folder, ngen, pop_size, brightness_range
             "Beta (Brightness)": beta
         })
 
-    # Save optimization results to CSV
     csv_path = os.path.join(result_folder, "optimization_results.csv")
     results_df = pd.DataFrame(results)
     results_df.to_csv(csv_path, index=False)
 
-    # Apply optimization results to full original images
     process_full_images(csv_path, source, full_processed_folder)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Image Processing and Optimization using YOLOv5")
+    parser = argparse.ArgumentParser(description="Image Processing and Optimization for 8-bit and 16-bit Images")
     parser.add_argument("--source", type=str, required=True, help="Path to the source image folder")
     parser.add_argument("--use_gpu", action="store_true", help="Use GPU for processing (default: False)")
     parser.add_argument("--ngen", type=int, default=50, help="Number of generations for optimization (default: 50)")
